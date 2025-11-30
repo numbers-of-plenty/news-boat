@@ -42,35 +42,48 @@ def parse_args():
     return parser.parse_args()
 
 
-async def single_agent_news(agent_name: str) -> str:
+
+
+
+async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: str = "") -> str:
     topics = config["agents"][agent_name]["topics"]
     topics_str = "\n".join(f"- {t}" for t in topics)
 
+    iteration_note = ""
+    if iteration > 1:
+        iteration_note = f"""
+        The agent has already produced the following news in a previous iteration:
+        {previous_news}  # truncate if too long
+        Your task is to now find additional news or events that were suggested in the previous output
+        or explore follow-ups the previous output hinted at. Especially focus on checking proposed websites and websites that might have events posted or listed. 
+        Produce ONLY new, non-duplicate items. Strictly only one news should be included per start-end block
+        """
+
     prompt = f"""
     Search the web. Focus heavily on the info published in the last 72 hours (3 days) but not limit the search to it. Today is
-    {datetime.datetime.now().strftime("%Y-%m-%d")}. The days that satisfy the "last 3 days" request are:
+    {datetime.datetime.now().strftime("%Y-%m-%d")}. The ONLY days that satisfy the "last 3 days" request are:
     - { (datetime.datetime.now() - datetime.timedelta(days=0)).strftime("%Y-%m-%d") }
     - { (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d") }
     - { (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d") }
     - { (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d") }
-    
+
     Fetch information for the following topics:
     {topics_str}
 
-    Return up to 10 items per topic.
-    Each item should be formatted as below with <START>,<END> and <PRIORITY>,</PRIORITY> strictly included for subsequent parsing. Strictly only one news should be included per start-end block.:
+    {iteration_note}
+
+    Return up to 10 items per topic. Each item must use this format with strict <START>/<END>/<PRIORITY> tags. Strictly only one news should be included per start-end block:
     <START>
     ### headline
     - 2-4 sentence summary
-    - publication date YYYY-MM-DD format or approximate YYYY-MM if exact date unknown
-    - OR the date of the most recent event described on the website if the publication date is not available (must be inside the last 72 hours or in the future).
+    - publication date YYYY-MM-DD or approximate YYYY-MM if exact date unknown
     - single link (Ensure to return the actual URLs, not only reference IDs.)
     <PRIORITY>numeric_value</PRIORITY>
     <END>
 
-        PRIORITY RULES (must use only integer values):
+    PRIORITY RULES:
     4 - Future events one could attend
-    3 - Publication explitely from the last 3 days
+    3 - Publication explitely from the last 3 days listed above
     2 - Date unknown but possibly within last 3 days
     1 - Older than 3 days but still recent
     1 - News come from the same website/source as a higher priority news item
@@ -78,34 +91,102 @@ async def single_agent_news(agent_name: str) -> str:
     0 - The news without any link/url/reference
     0 - Duplicate news covering the same event as another higher priority news item
 
-    Do not ask me for any confirmations or permissions, search outright.
+    Do not ask for any confirmation; search outright.
     """
 
     response = await client.responses.create(
         model="gpt-5-nano",
         tools=[{"type": "web_search"}],
-        reasoning={"effort": "small"},
+        reasoning={"effort": "low"},
         input=prompt,
         max_output_tokens=20000,
     )
-    return f"--- {agent_name} ---\n" + response.output_text
+
+    filename = f"news_{agent_name}_iter{iteration}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(response.output_text)
+
+    return filename
+
+
+
+# async def single_agent_news(agent_name: str) -> str:
+#     topics = config["agents"][agent_name]["topics"]
+#     topics_str = "\n".join(f"- {t}" for t in topics)
+
+#     prompt = f"""
+#     Search the web. Focus heavily on the info published in the last 72 hours (3 days) but not limit the search to it. Today is
+#     {datetime.datetime.now().strftime("%Y-%m-%d")}. The days that satisfy the "last 3 days" request are:
+#     - { (datetime.datetime.now() - datetime.timedelta(days=0)).strftime("%Y-%m-%d") }
+#     - { (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d") }
+#     - { (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d") }
+#     - { (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d") }
+    
+#     Fetch information for the following topics:
+#     {topics_str}
+
+#     Return up to 10 items per topic.
+#     Each item should be formatted as below with <START>,<END> and <PRIORITY>,</PRIORITY> strictly included for subsequent parsing. Strictly only one news should be included per start-end block.:
+#     <START>
+#     ### headline
+#     - 2-4 sentence summary
+#     - publication date YYYY-MM-DD format or approximate YYYY-MM if exact date unknown
+#     - OR the date of the most recent event described on the website if the publication date is not available (must be inside the last 72 hours or in the future).
+#     - single link (Ensure to return the actual URLs, not only reference IDs.)
+#     <PRIORITY>numeric_value</PRIORITY>
+#     <END>
+
+#         PRIORITY RULES (must use only integer values):
+#     4 - Future events one could attend
+#     3 - Publication explitely from the last 3 days
+#     2 - Date unknown but possibly within last 3 days
+#     1 - Older than 3 days but still recent
+#     1 - News come from the same website/source as a higher priority news item
+#     0 - Happened months ago or already ended live events
+#     0 - The news without any link/url/reference
+#     0 - Duplicate news covering the same event as another higher priority news item
+
+#     Do not ask me for any confirmations or permissions, search outright.
+#     """
+
+#     response = await client.responses.create(
+#         model="gpt-5-nano",
+#         tools=[{"type": "web_search"}],
+#         reasoning={"effort": "small"},
+#         input=prompt,
+#         max_output_tokens=20000,
+#     )
+#     return f"--- {agent_name} ---\n" + response.output_text
 
 
 async def all_agents_fetch_news():
-    tasks = []
-    for _ in range(runs):  # 2 synchronous runs per agent by default
-        for agent in config["agents"].keys():
-            tasks.append(single_agent_news(agent))
+    agent_files = {}
 
-    all_results = await asyncio.gather(*tasks)
-    raw_news = "\n\n".join(all_results)
-    # print(final_output)
+    # First iteration
+    for agent in config["agents"].keys():
+        file1 = await single_agent_news(agent, iteration=1)
+        agent_files.setdefault(agent, []).append(file1)
+
+    # Second iteration
+    for agent in config["agents"].keys():
+        with open(agent_files[agent][0], "r", encoding="utf-8") as f:
+            previous_news = f.read()
+        file2 = await single_agent_news(agent, iteration=2, previous_news=previous_news)
+        agent_files[agent].append(file2)
+
+    # Concatenate all agent files into one raw news file
+    all_results = []
+    for files in agent_files.values():
+        for file in files:
+            with open(file, "r", encoding="utf-8") as f:
+                all_results.append(f.read())
 
     raw_news_path = "news_raw.txt"
     with open(raw_news_path, "w", encoding="utf-8") as f:
-        f.write(raw_news)
-    
-    return raw_news
+        f.write("\n\n".join(all_results))
+
+    return raw_news_path, agent_files
+
 
 async def split_raw_news(raw_news_path: str, chunks_json_path: str):
     """
@@ -340,16 +421,6 @@ async def generate_audio(sentence: str, audio_path: str):
     ) as response:
         response.stream_to_file(audio_path)
 
-    # response = await client.audio.speech.create(
-    #     model="gpt-4o-mini-tts",
-    #     voice="alloy",
-    #     input=sentence
-    # )
-
-    # Modern API: audio_bytes **is already raw binary data**
-    # with open(audio_path, "wb") as f:
-    #     f.write(response)
-
     return response
 
 
@@ -359,7 +430,7 @@ async def main():
     print("Fetching news according to topics in the config")
     print("=" * 50 + "\n")
 
-    raw_news = await all_agents_fetch_news()
+    raw_news_path, agent_files = await all_agents_fetch_news()
 
     print("\n" + "=" * 50)
     print("Splitting RAW news into structured chunks...")
