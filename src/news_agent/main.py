@@ -226,7 +226,7 @@ async def split_raw_news(raw_news_path: str, chunks_json_path: str):
     return DummyResponse()
 
 
-async def embed_sentences(sentences):
+async def embed_text(sentences):
     
     response = await client.embeddings.create(
         model="text-embedding-3-small",
@@ -272,24 +272,23 @@ async def shuffle_sort_news(news_items: List[Dict], top_n: int = 40) -> List[Dic
     return top_news  
 
 
-async def embed_texts(news_texts):
+# async def embed_texts(news_texts):
     
-    tasks = []
-    for text in news_texts:
-        tasks.append(embed_sentences(text))
+#     tasks = []
+#     for text in news_texts:
+#         tasks.append(embed_sentences(text))
 
-    results = await asyncio.gather(*tasks)
+#     results = await asyncio.gather(*tasks)
 
-    sentences, embeddings = zip(*results)
-    # Create DataFrame: index = sentence, column = embedding vector
-    embeddings_df = pd.DataFrame({
-        "embedding": embeddings
-    }, index=sentences)
+#     sentences, embeddings = zip(*results)
+#     # Create DataFrame: index = sentence, column = embedding vector
+#     embeddings_df = pd.DataFrame({
+#         "embedding": embeddings
+#     }, index=sentences)
 
-    embeddings_df.to_csv('news_embeddings.tsv', sep = '\t')
-    return embeddings_df
+#     embeddings_df.to_csv('news_embeddings.tsv', sep = '\t')
+#     return embeddings_df
     
-
 
 # ---------------------------------------------------
 
@@ -312,11 +311,12 @@ class DuplicateCheckResponse(BaseModel):
     )
 
 
-async def llm_check_duplicate(news_text: str, news_embedding) -> bool:
+async def llm_check_duplicate(news_text) -> bool:
     """
     Check if a news item is a duplicate of past news.
     Returns True if NOT a duplicate (unique), False if it IS a duplicate.
     """
+    _, news_embedding = await embed_text(news_text)
     
     # Get the 3 most similar past news items
     past_news_list = await find_closest_past_news(news_embedding, top_n=3)
@@ -365,7 +365,65 @@ async def llm_check_duplicate(news_text: str, news_embedding) -> bool:
     result = response.choices[0].message.parsed
     
     # Return True if NOT duplicate, False if IS duplicate
-    return not result.is_duplicate
+    return not result.is_duplicate, news_embedding
+
+async def remove_duplicates(top_news):
+    """
+    Remove duplicate news items by checking each against past news.
+    Returns fresh (non-duplicate) news and their embeddings.
+    Writes fresh news to fresh_news.txt in raw format compatible with curate_news.
+    """
+    tasks = []
+    for news_item in top_news:
+        news_text = news_item['full_text']
+        tasks.append(llm_check_duplicate(news_text))
+    
+    results = await asyncio.gather(*tasks)
+    
+    fresh_news = []
+    embeddings = []
+    
+    i = 0 #add 11 news items maximum
+    for news_item, (is_not_duplicate, news_embedding) in zip(top_news, results):
+        if is_not_duplicate: #filter duplicates
+            i += 1
+            fresh_news.append(news_item)
+            embeddings.append(news_embedding)
+            if i > 10:
+                break
+    
+    fresh_news_raw = "\n\n".join([
+        f"{item['full_text']}\n\n" for item in fresh_news
+    ])
+    
+    with open("fresh_news.txt", "w", encoding="utf-8") as f:
+        f.write(fresh_news_raw)
+    
+    return fresh_news, embeddings
+
+
+    
+
+async def write_text_vectors(fresh_news, embeddings):
+    """
+    Write fresh news items and their embeddings to ChromaDB.
+    """
+    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    collection = chroma_client.get_or_create_collection(name="df_news_embeddings")
+    
+    # Prepare data for ChromaDB
+    ids = [f"news_{i}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}" for i in range(len(fresh_news))]
+    documents = [item['full_text'] for item in fresh_news]
+    
+    # Add to ChromaDB
+    collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents
+    )
+    
+    print(f"Added {len(fresh_news)} news items to ChromaDB")
+
 
 
 async def curate_news(raw_news_path: str, output_path: str) -> str:
@@ -539,41 +597,33 @@ async def generate_audio(sentence: str, audio_path: str):
     return response
 
 
+def print_section(message):
+    """Print a message wrapped with separator lines."""
+    print("\n" + "=" * 50)
+    print(message)
+    print("=" * 50 + "\n")
+
+
 async def main():
 
-    print("\n" + "=" * 50)
-    print("Fetching news according to topics in the config")
-    print("=" * 50 + "\n")
-
+    print_section("Fetching news according to topics in the config")
     raw_news_path, agent_files = await all_agents_fetch_news()
 
-    print("\n" + "=" * 50)
-    print("Splitting RAW news into structured chunks...")
-    print("=" * 50 + "\n")
-
-
+    print_section("Splitting RAW news into structured chunks...")
     raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
     list_of_news = raw_chunks.output_parsed
 
-    print("\n" + "=" * 50)
-    print("Selecting 40 news with highest priority")
-    print("=" * 50 + "\n")
+    print_section("Selecting 40 news with highest priority")
     top_news = await shuffle_sort_news(list_of_news, 10)
 
-    print("\n" + "=" * 50)
-    print('projecting news items into embeddings...')
-    print("=" * 50 + "\n")
+    print_section('projecting news items into embeddings...')
+    fresh_news, embeddings = await remove_duplicates(top_news)
 
-    news_texts = [text['full_text'] for text in top_news]
-    embeddings = await embed_texts(news_texts)
+    print_section('Writing embeddings to ChromaDB...')
+    await write_text_vectors(fresh_news, embeddings)
 
-
-    print("\n" + "=" * 50)
-    print("Curating news...")
-    print("=" * 50 + "\n")
-
-    curated_news = await curate_news(raw_news_path, "news_curated.txt")
-    # print(curated_news)
+    print_section("Curating news...")
+    curated_news = await curate_news("fresh_news.txt", "news_curated.txt")
 
     # flag to avoid language learning steps
     if args.skip_language:
@@ -581,23 +631,14 @@ async def main():
         print("Generated: news_raw.txt and news_curated.txt")
         return
 
-    print("\n" + "=" * 50)
-    print("Spanifying news...")
-    print("=" * 50 + "\n")
-
+    print_section("Spanifying news...")
     spanified_news = await spanify_news("news_curated.txt", "news_spanified.txt")
     # print(spanified_news)
 
-    print("\n" + "=" * 50)
-    print("Creating Spanish vocabulary sentence...")
-    print("=" * 50 + "\n")
-
+    print_section("Creating Spanish vocabulary sentence...")
     sentence = await make_spanish_sentence("news_spanified.txt", "spanish_sentence.txt")
 
-    print("\n" + "=" * 50)
-    print("Generating audio...")
-    print("=" * 50 + "\n")
-
+    print_section("Generating audio...")
     await generate_audio(sentence, "spanish_sentence.mp3")
 
     print("Sentence saved to spanish_sentence.txt")
