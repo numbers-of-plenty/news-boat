@@ -11,6 +11,10 @@ from typing import List, Optional
 import json
 import pandas as pd
 import re
+import random
+from collections import defaultdict
+from typing import List, Dict
+import chromadb
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -33,16 +37,13 @@ def parse_args():
         action="store_true",
         help="Skip spanification + Spanish sentence + audio generation (default: False)",
     )
-    parser.add_argument(
+    parser.add_argument( #TODO is not used now
         "--runs",
         type=int,
         default=None,
         help="How many times each agent should run (overrides the value in config file)",
     )
     return parser.parse_args()
-
-
-
 
 
 async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: str = "") -> str:
@@ -53,10 +54,11 @@ async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: 
     if iteration > 1:
         iteration_note = f"""
         The agent has already produced the following news in a previous iteration:
-        {previous_news}  # truncate if too long
-        Your task is to now find additional news or events that were suggested in the previous output
+        {previous_news}
+        If the previous agent didn't put <PRIORITY> tags, your job is to assign priorities according to the PRIORITY RULES below.
+        Otherwise, your task is to now to find additional news or events that were suggested in the previous output
         or explore follow-ups the previous output hinted at. Especially focus on checking proposed websites and websites that might have events posted or listed. 
-        Produce ONLY new, non-duplicate items. Strictly only one news should be included per start-end block
+        Produce ONLY new, non-duplicate items. Strictly only one news should be included per start-end block.
         """
 
     prompt = f"""
@@ -91,7 +93,7 @@ async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: 
     0 - The news without any link/url/reference
     0 - Duplicate news covering the same event as another higher priority news item
 
-    Do not ask for any confirmation; search outright.
+    Do not ask for any confirmation; search outright. If you didn't check something for some reason, specify it AFTER all the news items.
     """
 
     response = await client.responses.create(
@@ -107,7 +109,6 @@ async def single_agent_news(agent_name: str, iteration: int = 1, previous_news: 
         f.write(response.output_text)
 
     return filename
-
 
 
 # async def single_agent_news(agent_name: str) -> str:
@@ -233,13 +234,49 @@ async def embed_sentences(sentences):
     )
 
     return sentences, response.data[0].embedding
+
+
+async def shuffle_sort_news(news_items: List[Dict], top_n: int = 40) -> List[Dict]:
+    """
+    Sorts a list of news items by priority descending, shuffles within each priority group,
+    and returns the first `top_n` items.
     
+    Args:
+        news_items: List of dicts with keys 'full_text' and 'priority'.
+        top_n: Number of items to return after sorting and shuffling.
+    
+    Returns:
+        Sorted and shuffled list of news items (max length = top_n).
+    """
+    # Group news by priority
+    priority_groups = defaultdict(list)
+    for item in news_items['items']:
+        priority_groups[int(item["priority"])].append(item)
+
+    # Shuffle each group
+    for items in priority_groups.values():
+        random.shuffle(items)
+
+    # Sort priorities descending and flatten
+    sorted_news = []
+    for prio in sorted(priority_groups.keys(), reverse=True):
+        sorted_news.extend(priority_groups[prio])
+
+    # Take top_n
+    top_news = sorted_news[:top_n]
+
+    # Write json to the file top_raw_news
+    with open("top_raw_news.json", "w", encoding="utf-8") as f:
+        json.dump({"items": top_news}, f, ensure_ascii=False, indent=2)
+
+    return top_news  
+
 
 async def embed_texts(news_texts):
     
     tasks = []
-    for sentences in news_texts:
-        tasks.append(embed_sentences(sentences))
+    for text in news_texts:
+        tasks.append(embed_sentences(text))
 
     results = await asyncio.gather(*tasks)
 
@@ -251,6 +288,84 @@ async def embed_texts(news_texts):
 
     embeddings_df.to_csv('news_embeddings.tsv', sep = '\t')
     return embeddings_df
+    
+
+
+# ---------------------------------------------------
+
+async def find_closest_past_news(news_embed, top_n = 3):
+
+    client = chromadb.PersistentClient(path="./chroma_db") 
+    collection = client.get_or_create_collection(name="df_news_embeddings")
+    results = collection.query(
+        query_embeddings=[news_embed],
+        n_results=3,
+        include=['documents']
+    )
+  
+    return results['documents'][:top_n]
+
+
+class DuplicateCheckResponse(BaseModel):
+    is_duplicate: bool = Field(
+        description="True if the news is a duplicate of any past news, False if it's unique/new"
+    )
+
+
+async def llm_check_duplicate(news_text: str, news_embedding) -> bool:
+    """
+    Check if a news item is a duplicate of past news.
+    Returns True if NOT a duplicate (unique), False if it IS a duplicate.
+    """
+    
+    # Get the 3 most similar past news items
+    past_news_list = await find_closest_past_news(news_embedding, top_n=3)
+    
+    # Flatten the list if needed (chromadb returns nested structure)
+    if past_news_list and isinstance(past_news_list[0], list):
+        past_news_list = past_news_list[0]
+    
+    # Format past news for the prompt
+    past_news_formatted = "\n\n---\n\n".join(
+        [f"Past News {i+1}:\n{news}" for i, news in enumerate(past_news_list)]
+    ) if past_news_list else "No past news found"
+    
+    prompt = f"""
+    Determine if the CURRENT NEWS is a duplicate of any of the PAST NEWS items.
+    
+    A news item is considered a DUPLICATE if:
+    - It covers the exact same event/announcement
+    - It's about the same release/product with the same release date
+    - It's substantially the same story from a different source
+    
+    A news item is NOT a duplicate if:
+    - It's about a different event, even in the same category
+    - It's a follow-up or update with new information
+    - It's about a different episode/season/version of a series/game
+    - The dates or details are significantly different
+    
+    CURRENT NEWS:
+    {news_text}
+    
+    PAST NEWS:
+    {past_news_formatted}
+    
+    Respond with your assessment.
+    """
+    
+    response = await client.beta.chat.completions.parse(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a news duplicate detection system."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format=DuplicateCheckResponse,
+    )
+    
+    result = response.choices[0].message.parsed
+    
+    # Return True if NOT duplicate, False if IS duplicate
+    return not result.is_duplicate
 
 
 async def curate_news(raw_news_path: str, output_path: str) -> str:
@@ -436,20 +551,22 @@ async def main():
     print("Splitting RAW news into structured chunks...")
     print("=" * 50 + "\n")
 
+
     raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
     list_of_news = raw_chunks.output_parsed
 
     print("\n" + "=" * 50)
+    print("Selecting 40 news with highest priority")
+    print("=" * 50 + "\n")
+    top_news = await shuffle_sort_news(list_of_news, 10)
+
+    print("\n" + "=" * 50)
     print('projecting news items into embeddings...')
     print("=" * 50 + "\n")
-    # news_texts = [item["text"] for item in list_of_news]
 
-    with open('news_raw_separate_items.json', 'r', encoding='utf-8') as f:
-        news_texts = json.load(f)
-    news_texts = news_texts['items']
-    news_texts = [text['full_text'] for text in news_texts]
+    news_texts = [text['full_text'] for text in top_news]
+    embeddings = await embed_texts(news_texts)
 
-    embeddings = await embed_sentences(news_texts)
 
     print("\n" + "=" * 50)
     print("Curating news...")
