@@ -15,6 +15,7 @@ import random
 from collections import defaultdict
 from typing import List, Dict
 import chromadb
+from telethon import TelegramClient
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -43,7 +44,131 @@ def parse_args():
         default=None,
         help="How many times each agent should run (overrides the value in config file)",
     )
+    parser.add_argument(
+        "--use_telegram_api",
+        type=str,
+        default=None,
+        help="Use the Telegram API for sending news updates (default: None)",
+    )
     return parser.parse_args()
+
+
+async def get_telegram_context(config, output_file: str = "telegram_context.txt"):
+
+    load_dotenv()
+    api_hash = os.environ['API_HASH']
+    api_id = int(os.environ['API_ID'])
+    
+    # Calculate cutoff time (72 hours ago)
+    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=72)
+    
+    all_messages = []
+    group_ids = config.get("telegram_group_ids", [])
+    
+    async with TelegramClient("session", api_id, api_hash) as client:
+        for group_id in group_ids:
+            try:
+                print(f"Fetching messages from group {group_id}...")
+                message_count = 0
+                async for msg in client.iter_messages(group_id, limit=200):
+                    # Filter for messages from last 72 hours
+                    if msg.date and msg.date >= cutoff_time and msg.message:
+                        all_messages.append({
+                            'group_id': group_id,
+                            'date': msg.date,
+                            'message': msg.message
+                        })
+                        message_count += 1
+                print(f"  Found {message_count} messages from last 72 hours")
+            except Exception as e:
+                print(f"Error fetching from group {group_id}: {e}")
+    
+    # Sort by date
+    all_messages.sort(key=lambda x: x['date'], reverse=True)
+    
+    # Write to file
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"Telegram Messages from Last 72 Hours\n")
+        f.write(f"Collected on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total messages: {len(all_messages)}\n")
+        f.write("=" * 80 + "\n\n")
+        
+        for msg_data in all_messages:
+            # f.write(f"Group ID: {msg_data['group_id']}\n")
+            f.write(f"Date: {msg_data['date'].strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Message:\n{msg_data['message']}\n")
+            f.write("-" * 80 + "\n\n")
+    
+    print(f"Wrote {len(all_messages)} messages to {output_file}")
+    return output_file
+
+
+async def extract_telegram_news(config, telegram_context: str = "telegram_context.txt") -> str:
+    """
+    Extract news items from Telegram messages using LLM to analyze the context.
+    
+    Args:
+        config: Config dict containing agent topics
+        telegram_context_file: Path to the file containing Telegram messages
+    
+    Returns:
+        Filename of the output file containing extracted news in <NEWS_ITEM> format
+    """
+    
+    # Build topics string from all agents
+    all_topics = []
+    for agent_name, agent_data in config["agents"].items():
+        all_topics.extend(agent_data["topics"])
+    topics_str = "\n".join(f"- {t}" for t in all_topics)
+    
+    prompt = f"""
+    You are given messages from Telegram groups from the last 72 hours. Analyze these messages and extract any relevant news, events, or announcements that match the following topics:
+    
+    {topics_str}
+    
+    Today is {datetime.datetime.now().strftime("%Y-%m-%d")}.
+    
+    For each relevant news item found in the Telegram messages, format it using this strict structure:
+    <NEWS_ITEM>
+    ### headline, in one sentence, straight to the point, no ":" or "-" characters, just the news itself
+    - 1-3 sentence summary based on the Telegram message content
+    - message date YYYY-MM-DD (extract from the message date if available)
+    - if a link/URL is mentioned in the message, include it; otherwise write "Source: Telegram"
+    <PRIORITY>numeric_value</PRIORITY>
+    </NEWS_ITEM>
+    
+    PRIORITY RULES:
+    4 - Future events one could attend
+    3 - News/announcements from the last 3 days
+    2 - Date unclear but possibly recent
+    1 - Older discussions or past events
+    0 - Off-topic or irrelevant to the listed topics
+    
+    TELEGRAM CONTEXT:
+    {telegram_context}
+    
+    Extract all relevant news items following the format above. If no relevant news is found, state "No relevant news found in Telegram messages." and add a single unrelevant news.
+    """
+    
+    response = await client.chat.completions.create(
+        model="gpt-5-mini",
+        reasoning_effort="medium",
+        messages=[
+            {"role": "system", "content": "You are a news extraction assistant that analyzes Telegram messages and extracts relevant news items."},
+            {"role": "user", "content": prompt}
+        ],
+        max_completion_tokens=10000,
+    )
+    
+    output_text = response.choices[0].message.content
+    
+    filename = "news_raw_telegram.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(output_text)
+    
+    print(f"Extracted Telegram news to {filename}")
+    return output_text
+
 
 
 async def single_agent_news(agent_name: str, topics: List[str], iteration: int = 1, previous_news: str = "") -> str:
@@ -75,7 +200,7 @@ async def single_agent_news(agent_name: str, topics: List[str], iteration: int =
 
     Return up to 10 items per topic. Each item must use this format with strict <NEWS_ITEM>/<PRIORITY> tags. Strictly only one news should be included per start-end block:
     <NEWS_ITEM>
-    ### headline
+    ### headline, in one sentence, straight to the point, no ":" or "-" characters, don't mention the category/subcategory, just the news itself
     - 2-4 sentence summary
     - publication date YYYY-MM-DD or approximate YYYY-MM if exact date unknown
     - single link (Ensure to return the actual URLs, not only reference IDs.)
@@ -376,17 +501,22 @@ async def write_text_vectors(fresh_news, embeddings):
     collection = chroma_client.get_or_create_collection(name="df_news_embeddings")
     
     # Prepare data for ChromaDB
-    ids = [f"news_{i}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}" for i in range(len(fresh_news))]
+    current_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    
+    ids = [f"news_{i}_{current_timestamp}" for i in range(len(fresh_news))]
     documents = [item['full_text'] for item in fresh_news]
+    metadatas = [{"added_date": current_date} for item in fresh_news]
     
     # Add to ChromaDB
     collection.add(
         ids=ids,
         embeddings=embeddings,
-        documents=documents
+        documents=documents,
+        metadatas=metadatas
     )
     
-    print(f"Added {len(fresh_news)} news items to ChromaDB")
+    print(f"Added {len(fresh_news)} news items to ChromaDB with date {current_date}")
 
 
 
@@ -403,11 +533,14 @@ async def curate_news(raw_news_path: str, output_path: str) -> str:
     You are given raw news/events data collected by multiple agents. Process this data according to these requirements:
     
     1. Delete any duplicate news items covering the same event. Leave only one such news item.
-    2. Check that the news item has the actual date. Try to find the real date if it's wrong.
-    3. Check that the link/URL is valid and points to the actual news source. If not, try to find a valid link with the news. If you can't find a valid link, discard the news item.
+    2. Visit the links provided to verify the date, link and actuality of the news item. If date not correct, fix it. 
+    3. Pay special attention when the date in the link string contradicts the date in the news item.
+    4. If news item doesn't have a date or a link, try to find it. 
+    5. If the actual link can not be found, discard the news item.
+    
     
     OUTPUT FORMAT:
-    4. Format each news item with this exact structure so that they were uniform:
+    6. Format each news item with this exact structure so that they were uniform:
        
        ## [Headline]
        [Several sentence summary copy-pasted from the given news]    
@@ -455,7 +588,7 @@ async def main():
     list_of_news = raw_chunks.output_parsed
 
     print_section("Selecting 40 news with highest priority")
-    top_news = await shuffle_sort_news(list_of_news, 40)
+    top_news = await shuffle_sort_news(list_of_news, 60)
 
     print_section('projecting news items into embeddings...')
     fresh_news, embeddings = await remove_duplicates(top_news)
