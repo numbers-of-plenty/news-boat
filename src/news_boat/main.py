@@ -46,18 +46,32 @@ def parse_args():
     )
     parser.add_argument(
         "--use_telegram_api",
+        action="store_true",
+        help="Use the Telegram API for sending news updates (default: False)",
+    )
+    parser.add_argument(
+        "--api_hash",
         type=str,
         default=None,
-        help="Use the Telegram API for sending news updates (default: None)",
+        help="Telegram API hash (default: reads from .env file)",
+    )
+    parser.add_argument(
+        "--api_id",
+        type=int,
+        default=None,
+        help="Telegram API ID (default: reads from .env file)",
     )
     return parser.parse_args()
 
 
-async def get_telegram_context(config, output_file: str = "telegram_context.txt"):
+async def get_telegram_context(config, output_file: str = "telegram_context.txt", api_hash: str = None, api_id: int = None):
 
     load_dotenv()
-    api_hash = os.environ['API_HASH']
-    api_id = int(os.environ['API_ID'])
+    # Use provided arguments or fall back to environment variables
+    if api_hash is None:
+        api_hash = os.environ['API_HASH']
+    if api_id is None:
+        api_id = int(os.environ['API_ID'])
     
     # Calculate cutoff time (72 hours ago)
     cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=72)
@@ -85,25 +99,20 @@ async def get_telegram_context(config, output_file: str = "telegram_context.txt"
     
     # Sort by date
     all_messages.sort(key=lambda x: x['date'], reverse=True)
-    
+
+    joined_messages = "\n\n".join([
+        f"Date: {msg_data['date'].strftime('%Y-%m-%d %H:%M:%S')}\nMessage:\n{msg_data['message']}" for msg_data in all_messages
+    ])
+
     # Write to file
     with open(output_file, "w", encoding="utf-8") as f:
-        f.write(f"Telegram Messages from Last 72 Hours\n")
-        f.write(f"Collected on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Total messages: {len(all_messages)}\n")
-        f.write("=" * 80 + "\n\n")
-        
-        for msg_data in all_messages:
-            # f.write(f"Group ID: {msg_data['group_id']}\n")
-            f.write(f"Date: {msg_data['date'].strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Message:\n{msg_data['message']}\n")
-            f.write("-" * 80 + "\n\n")
+        f.write(joined_messages)
     
-    print(f"Wrote {len(all_messages)} messages to {output_file}")
-    return output_file
+    # print(f"Wrote {len(all_messages)} messages to {output_file}")
+    return all_messages
 
 
-async def extract_telegram_news(config, telegram_context: str = "telegram_context.txt") -> str:
+async def extract_telegram_news(config, telegram_context) -> str:
     """
     Extract news items from Telegram messages using LLM to analyze the context.
     
@@ -147,7 +156,7 @@ async def extract_telegram_news(config, telegram_context: str = "telegram_contex
     TELEGRAM CONTEXT:
     {telegram_context}
     
-    Extract all relevant news items following the format above. If no relevant news is found, state "No relevant news found in Telegram messages." and add a single unrelevant news.
+    Extract all relevant news items following the format above.
     """
     
     response = await client.chat.completions.create(
@@ -305,8 +314,8 @@ async def split_raw_news(raw_news_path: str, chunks_json_path: str):
             "priority": priority
         })
 
-    with open(chunks_json_path, "w", encoding="utf-8") as f:
-        json.dump({"items": items}, f, ensure_ascii=False, indent=2)
+    # with open(chunks_json_path, "w", encoding="utf-8") as f:
+    #     json.dump({"items": items}, f, ensure_ascii=False, indent=2)
 
     # legacy compatibility
     class DummyResponse:
@@ -580,26 +589,60 @@ def print_section(message):
 
 async def main():
 
-    print_section("Fetching news according to topics in the config")
-    raw_news_path, agent_files = await all_agents_fetch_news(config)
+    if not args.use_telegram_api:
 
-    print_section("Splitting RAW news into structured chunks...")
-    raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
-    list_of_news = raw_chunks.output_parsed
+        print_section("Fetching news according to topics in the config")
+        raw_news_path, agent_files = await all_agents_fetch_news(config)
 
-    print_section("Selecting 40 news with highest priority")
-    top_news = await shuffle_sort_news(list_of_news, 60)
+        print_section("Splitting RAW news into structured chunks...")
+        raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
+        list_of_news = raw_chunks.output_parsed
 
-    print_section('projecting news items into embeddings...')
-    fresh_news, embeddings = await remove_duplicates(top_news)
+        print_section("Selecting 40 news with highest priority")
+        top_news = await shuffle_sort_news(list_of_news, 60)
 
-    print_section('Writing embeddings to ChromaDB...')
-    await write_text_vectors(fresh_news, embeddings)
+        print_section('projecting news items into embeddings...')
+        fresh_news, embeddings = await remove_duplicates(top_news)
 
-    print_section("Curating news...")
-    curated_news = await curate_news("fresh_news.txt", "news_curated.txt")
+        print_section('Writing embeddings to ChromaDB...')
+        await write_text_vectors(fresh_news, embeddings)
 
-    print("\nfinished!")
+        print_section("Curating news...")
+        curated_news = await curate_news("fresh_news.txt", "news_curated.txt")
+
+        print("\nfinished!")
+    
+    else:
+        
+        print_section("Fetching Telegram context...")
+        telegram_context_file = await get_telegram_context(config, api_hash=args.api_hash, api_id=args.api_id)
+
+        print_section("Extracting news from Telegram messages...")
+        telegram_news_raw = await extract_telegram_news(config, telegram_context_file)
+
+        #split telegram news
+        print_section("Splitting RAW Telegram news into structured chunks...")
+        telegram_chunks = await split_raw_news("news_raw_telegram.txt", "news_raw_telegram_separate_items.json")
+        telegram_list_of_news = telegram_chunks.output_parsed
+
+        print_section("Selecting up to 40 Telegram news with highest priority")
+        top_telegram_news = await shuffle_sort_news(telegram_list_of_news, 40)
+
+        print_section('projecting Telegram news items into embeddings...')
+        fresh_telegram_news, telegram_embeddings = await remove_duplicates(top_telegram_news)
+
+        print_section('Writing Telegram news embeddings to ChromaDB...')
+        await write_text_vectors(fresh_telegram_news, telegram_embeddings)
+
+        # write fresh_telegram_news as a file
+        fresh_telegram_news = "\n\n".join([
+            f"{item['full_text']}\n\n" for item in fresh_telegram_news
+        ])
+        with open("fresh_telegram_news.txt", "w", encoding="utf-8") as f:
+            f.write(fresh_telegram_news)
+
+        #no curation for telegram news for now
+        print("\nfinished!")
 
 
 if __name__ == "__main__":
