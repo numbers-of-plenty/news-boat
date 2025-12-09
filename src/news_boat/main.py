@@ -18,7 +18,6 @@ import chromadb
 from telethon import TelegramClient
 
 load_dotenv()
-client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 number_of_news = 20  # Number of news items to curate
 
 
@@ -61,6 +60,14 @@ def parse_args():
         default=None,
         help="Telegram API ID (default: reads from .env file)",
     )
+
+    parser.add_argument(
+        "--openai_api_key",
+        type=str,
+        default=None,
+        help="OpenAI API key (reads from .env file if not provided). If argument's value is False, then OpenAI API won't be used.",
+    )
+
     return parser.parse_args()
 
 
@@ -588,32 +595,27 @@ def print_section(message):
 
 
 async def main():
-
-    if not args.use_telegram_api:
-
-        print_section("Fetching news according to topics in the config")
-        raw_news_path, agent_files = await all_agents_fetch_news(config)
-
-        print_section("Splitting RAW news into structured chunks...")
-        raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
-        list_of_news = raw_chunks.output_parsed
-
-        print_section("Selecting 40 news with highest priority")
-        top_news = await shuffle_sort_news(list_of_news, 60)
-
-        print_section('projecting news items into embeddings...')
-        fresh_news, embeddings = await remove_duplicates(top_news)
-
-        print_section('Writing embeddings to ChromaDB...')
-        await write_text_vectors(fresh_news, embeddings)
-
-        print_section("Curating news...")
-        curated_news = await curate_news("fresh_news.txt", "news_curated.txt")
-
-        print("\nfinished!")
+    global client
     
+    # Initialize OpenAI client based on --openai_api_key argument
+    if args.openai_api_key == "False":
+        # If argument's value is False, then OpenAI API won't be used
+        client = None
+        use_openai = False
+    elif args.openai_api_key:
+        # Use provided API key
+        client = AsyncOpenAI(api_key=args.openai_api_key)
+        use_openai = True
+    elif os.environ.get("OPENAI_API_KEY"):
+        # Fall back to .env file
+        client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        use_openai = True
     else:
-        
+        client = None
+        use_openai = False
+
+    if args.use_telegram_api:
+
         print_section("Fetching Telegram context...")
         telegram_context_file = await get_telegram_context(config, api_hash=args.api_hash, api_id=args.api_id)
 
@@ -641,8 +643,43 @@ async def main():
         with open("fresh_telegram_news.txt", "w", encoding="utf-8") as f:
             f.write(fresh_telegram_news)
 
-        #no curation for telegram news for now
-        print("\nfinished!")
+        print(f"Telegram news are ready at fresh_telegram_news.txt")
+
+    if use_openai:
+
+        print_section("Fetching news according to topics in the config")
+        raw_news_path, agent_files = await all_agents_fetch_news(config)
+
+        print_section("Splitting RAW news into structured chunks...")
+        raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
+        list_of_news = raw_chunks.output_parsed
+
+        print_section("Selecting 40 news with highest priority")
+        top_news = await shuffle_sort_news(list_of_news, 60)
+
+        print_section('projecting news items into embeddings...')
+        fresh_news, embeddings = await remove_duplicates(top_news)
+
+        print_section('Writing embeddings to ChromaDB...')
+        await write_text_vectors(fresh_news, embeddings)
+
+        print_section("Curating news...")
+        curated_news = await curate_news("fresh_news.txt", "web_news.txt")
+
+        print(f"News from web are ready at web_news.txt")
+
+
+    if args.use_telegram_api and use_openai:
+        print_section("Combining curated news with Telegram news...")
+
+        combined_news = curated_news + "\n\n" + fresh_telegram_news
+
+        with open("web_telegram_news.txt", "w", encoding="utf-8") as f:
+            f.write(combined_news)
+
+        print(f"Combined news from web and Telegram are ready at web_telegram_news.txt")
+
+    print("\nfinished!")
 
 
 if __name__ == "__main__":
