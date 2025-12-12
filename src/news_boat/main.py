@@ -142,7 +142,7 @@ async def extract_telegram_news(config, telegram_context) -> str:
     
     {topics_str}
     
-    Today is {datetime.datetime.now().strftime("%Y-%m-%d")}.
+    # Today is {datetime.datetime.now().strftime("%Y-%m-%d")}.
     
     For each relevant news item found in the Telegram messages, format it using this strict structure:
     <NEWS_ITEM>
@@ -163,7 +163,7 @@ async def extract_telegram_news(config, telegram_context) -> str:
     TELEGRAM CONTEXT:
     {telegram_context}
     
-    Extract all relevant news items following the format above.
+    Extract all relevant news items following the format above, in English.
     """
     
     response = await client.chat.completions.create(
@@ -186,6 +186,44 @@ async def extract_telegram_news(config, telegram_context) -> str:
     return output_text
 
 
+def get_future_dates() -> str:
+    """
+    Generate a formatted string of future dates for the next 7 days, 3 months, and next year.
+    
+    Returns:
+        Formatted string with future dates
+    """
+    today = datetime.datetime.now()
+    
+    # Next 7 days
+    next_7_days = [
+        (today + datetime.timedelta(days=i)).strftime("%Y-%m-%d") 
+        for i in range(1, 8)
+    ]
+    
+    # Next 3 months (without specific days)
+    next_3_months = []
+    for i in range(1, 4):
+        future_month = today.month + i
+        future_year = today.year
+        
+        # Handle year rollover
+        while future_month > 12:
+            future_month -= 12
+            future_year += 1
+        
+        next_3_months.append(f"{future_year}-{future_month:02d}")
+    
+    # Next year
+    next_year = str(today.year + 1)
+    
+    # Format output
+    future_dates = "- " + "\n- ".join(next_7_days)
+    future_dates += "\n- " + "\n- ".join(next_3_months)
+    future_dates += f"\n- {next_year}"
+    
+    return future_dates
+
 
 async def single_agent_news(agent_name: str, topics: List[str], iteration: int = 1, previous_news: str = "") -> str:
     topics_str = "\n".join(f"- {t}" for t in topics)
@@ -201,6 +239,8 @@ async def single_agent_news(agent_name: str, topics: List[str], iteration: int =
         Produce ONLY new, non-duplicate items. Strictly only one news should be included per <NEWS_ITEM> ... </NEWS_ITEM> block.
         """
 
+    future_dates_str = get_future_dates()
+    
     prompt = f"""
     Search the web. Focus heavily on the info published in the last 72 hours (3 days) but not limit the search to it. Today is
     {datetime.datetime.now().strftime("%Y-%m-%d")}. The ONLY days that satisfy the "last 3 days" request are:
@@ -208,6 +248,10 @@ async def single_agent_news(agent_name: str, topics: List[str], iteration: int =
     - { (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d") }
     - { (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d") }
     - { (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d") }
+
+    As for future events, here are the dates that clearly lie in the future:
+    {future_dates_str}
+
 
     Fetch information for the following topics:
     {topics_str}
