@@ -516,7 +516,7 @@ async def llm_check_duplicate(news_text) -> bool:
     # Return True if NOT duplicate, False if IS duplicate
     return not result.is_duplicate, news_embedding
 
-async def remove_duplicates(top_news):
+async def remove_duplicates(top_news, path_to_write = None):
     """
     Remove duplicate news items by checking each against past news.
     Returns fresh (non-duplicate) news and their embeddings.
@@ -544,9 +544,10 @@ async def remove_duplicates(top_news):
     fresh_news_raw = "\n\n".join([
         f"{item['full_text']}\n\n" for item in fresh_news
     ])
-    
-    with open("fresh_news.txt", "w", encoding="utf-8") as f:
-        f.write(fresh_news_raw)
+
+    if path_to_write:
+        with open(path_to_write, "w", encoding="utf-8") as f:
+            f.write(fresh_news_raw)
     
     return fresh_news, embeddings
 
@@ -567,14 +568,15 @@ async def write_text_vectors(fresh_news, embeddings):
     ids = [f"news_{i}_{current_timestamp}" for i in range(len(fresh_news))]
     documents = [item['full_text'] for item in fresh_news]
     metadatas = [{"added_date": current_date} for item in fresh_news]
-    
-    # Add to ChromaDB
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=documents,
-        metadatas=metadatas
-    )
+
+    # Add to ChromaDB if any fresh news
+    if len(fresh_news) > 0:
+        collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas
+        )       
     
     print(f"Added {len(fresh_news)} news items to ChromaDB with date {current_date}")
 
@@ -675,7 +677,7 @@ async def main():
         top_telegram_news = await shuffle_sort_news(telegram_list_of_news, 40)
 
         print_section('projecting Telegram news items into embeddings...')
-        fresh_telegram_news, telegram_embeddings = await remove_duplicates(top_telegram_news)
+        fresh_telegram_news, telegram_embeddings = await remove_duplicates(top_telegram_news, path_to_write="fresh_telegram_news.txt")
 
         print_section('Writing Telegram news embeddings to ChromaDB...')
         await write_text_vectors(fresh_telegram_news, telegram_embeddings)
@@ -684,8 +686,8 @@ async def main():
         fresh_telegram_news = "\n\n".join([
             f"{item['full_text']}\n\n" for item in fresh_telegram_news
         ])
-        with open("fresh_telegram_news.txt", "w", encoding="utf-8") as f:
-            f.write(fresh_telegram_news)
+        # with open("fresh_telegram_news.txt", "w", encoding="utf-8") as f:
+        #     f.write(fresh_telegram_news)
 
         print(f"Telegram news are ready at fresh_telegram_news.txt")
 
