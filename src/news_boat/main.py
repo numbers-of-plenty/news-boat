@@ -1,19 +1,17 @@
 import os
 import datetime
 import asyncio
-import openai
 import yaml
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import argparse
-from pydantic import BaseModel, Field, HttpUrl
-from typing import List, Optional
+from pydantic import BaseModel, Field
+from typing import List
 import json
-import pandas as pd
 import re
 import random
 from collections import defaultdict
-from typing import List, Dict
+from typing import Dict
 import chromadb
 from telethon import TelegramClient
 
@@ -37,7 +35,7 @@ def parse_args():
         action="store_true",
         help="Skip spanification + Spanish sentence + audio generation (default: False)",
     )
-    parser.add_argument( #TODO is not used now
+    parser.add_argument(  # TODO is not used now
         "--runs",
         type=int,
         default=None,
@@ -71,21 +69,30 @@ def parse_args():
     return parser.parse_args()
 
 
-async def get_telegram_context(config, output_file: str = "telegram_context.txt", api_hash: str = None, api_id: int = None):
+def load_config(config_path: str) -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    return config
 
+
+async def get_telegram_context(
+    config, write_to_path: str = None, api_hash: str = None, api_id: int = None
+):
     load_dotenv()
     # Use provided arguments or fall back to environment variables
     if api_hash is None:
-        api_hash = os.environ['API_HASH']
+        api_hash = os.environ["API_HASH"]
     if api_id is None:
-        api_id = int(os.environ['API_ID'])
-    
+        api_id = int(os.environ["API_ID"])
+
     # Calculate cutoff time (72 hours ago)
-    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=72)
-    
+    cutoff_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        hours=72
+    )
+
     all_messages = []
     group_ids = config.get("telegram_group_ids", [])
-    
+
     async with TelegramClient("session", api_id, api_hash) as client:
         for group_id in group_ids:
             try:
@@ -94,27 +101,33 @@ async def get_telegram_context(config, output_file: str = "telegram_context.txt"
                 async for msg in client.iter_messages(group_id, limit=200):
                     # Filter for messages from last 72 hours
                     if msg.date and msg.date >= cutoff_time and msg.message:
-                        all_messages.append({
-                            'group_id': group_id,
-                            'date': msg.date,
-                            'message': msg.message
-                        })
+                        all_messages.append(
+                            {
+                                "group_id": group_id,
+                                "date": msg.date,
+                                "message": msg.message,
+                            }
+                        )
                         message_count += 1
                 print(f"  Found {message_count} messages from last 72 hours")
             except Exception as e:
                 print(f"Error fetching from group {group_id}: {e}")
-    
-    # Sort by date
-    all_messages.sort(key=lambda x: x['date'], reverse=True)
 
-    joined_messages = "\n\n".join([
-        f"Date: {msg_data['date'].strftime('%Y-%m-%d %H:%M:%S')}\nMessage:\n{msg_data['message']}" for msg_data in all_messages
-    ])
+    # Sort by date
+    all_messages.sort(key=lambda x: x["date"], reverse=True)
+
+    joined_messages = "\n\n".join(
+        [
+            f"Date: {msg_data['date'].strftime('%Y-%m-%d %H:%M:%S')}\nMessage:\n{msg_data['message']}"
+            for msg_data in all_messages
+        ]
+    )
 
     # Write to file
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(joined_messages)
-    
+    if write_to_path:
+        with open(write_to_path, "w", encoding="utf-8") as f:
+            f.write(joined_messages)
+
     # print(f"Wrote {len(all_messages)} messages to {output_file}")
     return all_messages
 
@@ -122,21 +135,21 @@ async def get_telegram_context(config, output_file: str = "telegram_context.txt"
 async def extract_telegram_news(config, telegram_context) -> str:
     """
     Extract news items from Telegram messages using LLM to analyze the context.
-    
+
     Args:
         config: Config dict containing agent topics
         telegram_context_file: Path to the file containing Telegram messages
-    
+
     Returns:
         Filename of the output file containing extracted news in <NEWS_ITEM> format
     """
-    
+
     # Build topics string from all agents
     all_topics = []
     for agent_name, agent_data in config["agents"].items():
         all_topics.extend(agent_data["topics"])
     topics_str = "\n".join(f"- {t}" for t in all_topics)
-    
+
     prompt = f"""
     You are given messages from Telegram groups from the last 72 hours. Analyze these messages and extract any relevant news, events, or announcements that match the following topics:
     
@@ -149,7 +162,7 @@ async def extract_telegram_news(config, telegram_context) -> str:
     ### headline, in one sentence, straight to the point, no ":" or "-" characters, just the news itself
     - 1-3 sentence summary based on the Telegram message content
     - message date YYYY-MM-DD (extract from the message date if available)
-    - if a link/URL is mentioned in the message, include it; otherwise write "Source: Telegram"
+    - if a link/URL is mentioned in the message, include it; otherwise write "Source: [the name of the group starting with @ in the end of the message]]"
     <PRIORITY>numeric_value</PRIORITY>
     </NEWS_ITEM>
     
@@ -165,23 +178,26 @@ async def extract_telegram_news(config, telegram_context) -> str:
     
     Extract all relevant news items following the format above, in English.
     """
-    
+
     response = await client.chat.completions.create(
         model="gpt-5-mini",
         reasoning_effort="medium",
         messages=[
-            {"role": "system", "content": "You are a news extraction assistant that analyzes Telegram messages and extracts relevant news items."},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": "You are a news extraction assistant that analyzes Telegram messages and extracts relevant news items.",
+            },
+            {"role": "user", "content": prompt},
         ],
         max_completion_tokens=10000,
     )
-    
+
     output_text = response.choices[0].message.content
-    
+
     filename = "news_raw_telegram.txt"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(output_text)
-    
+
     print(f"Extracted Telegram news to {filename}")
     return output_text
 
@@ -189,43 +205,44 @@ async def extract_telegram_news(config, telegram_context) -> str:
 def get_future_dates() -> str:
     """
     Generate a formatted string of future dates for the next 7 days, 3 months, and next year.
-    
+
     Returns:
         Formatted string with future dates
     """
     today = datetime.datetime.now()
-    
+
     # Next 7 days
     next_7_days = [
-        (today + datetime.timedelta(days=i)).strftime("%Y-%m-%d") 
-        for i in range(1, 8)
+        (today + datetime.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)
     ]
-    
+
     # Next 3 months (without specific days)
     next_3_months = []
     for i in range(1, 4):
         future_month = today.month + i
         future_year = today.year
-        
+
         # Handle year rollover
         while future_month > 12:
             future_month -= 12
             future_year += 1
-        
+
         next_3_months.append(f"{future_year}-{future_month:02d}")
-    
+
     # Next year
     next_year = str(today.year + 1)
-    
+
     # Format output
     future_dates = "- " + "\n- ".join(next_7_days)
     future_dates += "\n- " + "\n- ".join(next_3_months)
     future_dates += f"\n- {next_year}"
-    
+
     return future_dates
 
 
-async def single_agent_news(agent_name: str, topics: List[str], iteration: int = 1, previous_news: str = "") -> str:
+async def single_agent_news(
+    agent_name: str, topics: List[str], iteration: int = 1, previous_news: str = ""
+) -> str:
     topics_str = "\n".join(f"- {t}" for t in topics)
 
     iteration_note = ""
@@ -240,14 +257,14 @@ async def single_agent_news(agent_name: str, topics: List[str], iteration: int =
         """
 
     future_dates_str = get_future_dates()
-    
+
     prompt = f"""
     Search the web. Focus heavily on the info published in the last 72 hours (3 days) but not limit the search to it. Today is
     {datetime.datetime.now().strftime("%Y-%m-%d")}. The ONLY days that satisfy the "last 3 days" request are:
-    - { (datetime.datetime.now() - datetime.timedelta(days=0)).strftime("%Y-%m-%d") }
-    - { (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d") }
-    - { (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d") }
-    - { (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d") }
+    - {(datetime.datetime.now() - datetime.timedelta(days=0)).strftime("%Y-%m-%d")}
+    - {(datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")}
+    - {(datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d")}
+    - {(datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d")}
 
     As for future events, here are the dates that clearly lie in the future:
     {future_dates_str}
@@ -295,7 +312,9 @@ async def single_agent_news(agent_name: str, topics: List[str], iteration: int =
     return filename
 
 
-async def all_agents_fetch_news(config):
+async def all_agents_fetch_news(
+    config, write_to_path: str = None
+) -> (str, Dict[str, List[str]]):
     agent_files = {}
 
     # First iteration
@@ -305,9 +324,9 @@ async def all_agents_fetch_news(config):
         agent_names.append(agent_name)
         topics = agent_data["topics"]
         first_iteration_tasks.append(single_agent_news(agent_name, topics, iteration=1))
-    
+
     first_iteration_files = await asyncio.gather(*first_iteration_tasks)
-    
+
     for agent_name, file1 in zip(agent_names, first_iteration_files):
         agent_files[agent_name] = [file1]
 
@@ -317,10 +336,14 @@ async def all_agents_fetch_news(config):
         with open(agent_files[agent_name][0], "r", encoding="utf-8") as f:
             previous_news = f.read()
         topics = config["agents"][agent_name]["topics"]
-        second_iteration_tasks.append(single_agent_news(agent_name, topics, iteration=2, previous_news=previous_news))
-    
+        second_iteration_tasks.append(
+            single_agent_news(
+                agent_name, topics, iteration=2, previous_news=previous_news
+            )
+        )
+
     second_iteration_files = await asyncio.gather(*second_iteration_tasks)
-    
+
     for agent_name, file2 in zip(agent_names, second_iteration_files):
         agent_files[agent_name].append(file2)
 
@@ -331,39 +354,41 @@ async def all_agents_fetch_news(config):
             with open(file, "r", encoding="utf-8") as f:
                 all_results.append(f.read())
 
-    raw_news_path = "news_raw.txt"
-    with open(raw_news_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(all_results))
+    raw_news = "\n\n".join(all_results)
 
-    return raw_news_path, agent_files
+    if write_to_path:
+        with open(write_to_path, "w", encoding="utf-8") as f:
+            f.write(raw_news)
+
+    return raw_news, agent_files
 
 
-async def split_raw_news(raw_news_path: str, chunks_json_path: str):
+async def split_raw_news(raw_news: str, write_to_path: str = None):
     """
     Split RAW news text into structured JSON items, extracting:
     - full_text (everything between <NEWS_ITEM> and </NEWS_ITEM>)
     - priority (integer from <PRIORITY> tag)
     """
 
-    with open(raw_news_path, "r", encoding="utf-8") as f:
-        raw_news = f.read()
-
     # Regex for each news block
-    news_pattern = re.compile(r"<NEWS_ITEM>(.*?)</NEWS_ITEM>", re.DOTALL | re.IGNORECASE)
+    news_pattern = re.compile(
+        r"<NEWS_ITEM>(.*?)</NEWS_ITEM>", re.DOTALL | re.IGNORECASE
+    )
     news_blocks = news_pattern.findall(raw_news)
 
     items = []
     for block in news_blocks:
         block_clean = block.strip()
-        prio_match = re.search(r"<PRIORITY>(\d+)</PRIORITY>", block_clean, re.IGNORECASE)
+        prio_match = re.search(
+            r"<PRIORITY>(\d+)</PRIORITY>", block_clean, re.IGNORECASE
+        )
         priority = int(prio_match.group(1)) if prio_match else 0
         # Remove priority tag from full_text
-        full_text_clean = re.sub(r"<PRIORITY>\d+</PRIORITY>", "", block_clean, flags=re.IGNORECASE).strip()
+        full_text_clean = re.sub(
+            r"<PRIORITY>\d+</PRIORITY>", "", block_clean, flags=re.IGNORECASE
+        ).strip()
 
-        items.append({
-            "full_text": full_text_clean,
-            "priority": priority
-        })
+        items.append({"full_text": full_text_clean, "priority": priority})
 
     # with open(chunks_json_path, "w", encoding="utf-8") as f:
     #     json.dump({"items": items}, f, ensure_ascii=False, indent=2)
@@ -376,7 +401,6 @@ async def split_raw_news(raw_news_path: str, chunks_json_path: str):
 
 
 async def embed_text(sentences):
-    
     response = await client.embeddings.create(
         model="text-embedding-3-small",
         input=sentences,
@@ -389,17 +413,17 @@ async def shuffle_sort_news(news_items: List[Dict], top_n: int = 40) -> List[Dic
     """
     Sorts a list of news items by priority descending, shuffles within each priority group,
     and returns the first `top_n` items.
-    
+
     Args:
         news_items: List of dicts with keys 'full_text' and 'priority'.
         top_n: Number of items to return after sorting and shuffling.
-    
+
     Returns:
         Sorted and shuffled list of news items (max length = top_n).
     """
     # Group news by priority
     priority_groups = defaultdict(list)
-    for item in news_items['items']:
+    for item in news_items["items"]:
         priority_groups[int(item["priority"])].append(item)
 
     # Shuffle each group
@@ -418,11 +442,11 @@ async def shuffle_sort_news(news_items: List[Dict], top_n: int = 40) -> List[Dic
     with open("top_raw_news.json", "w", encoding="utf-8") as f:
         json.dump({"items": top_news}, f, ensure_ascii=False, indent=2)
 
-    return top_news  
+    return top_news
 
 
 # async def embed_texts(news_texts):
-    
+
 #     tasks = []
 #     for text in news_texts:
 #         tasks.append(embed_sentences(text))
@@ -437,21 +461,19 @@ async def shuffle_sort_news(news_items: List[Dict], top_n: int = 40) -> List[Dic
 
 #     embeddings_df.to_csv('news_embeddings.tsv', sep = '\t')
 #     return embeddings_df
-    
+
 
 # ---------------------------------------------------
 
-async def find_closest_past_news(news_embed, top_n = 3):
 
-    client = chromadb.PersistentClient(path="./chroma_db") 
+async def find_closest_past_news(news_embed, top_n=3):
+    client = chromadb.PersistentClient(path="./chroma_db")
     collection = client.get_or_create_collection(name="df_news_embeddings")
     results = collection.query(
-        query_embeddings=[news_embed],
-        n_results=3,
-        include=['documents']
+        query_embeddings=[news_embed], n_results=3, include=["documents"]
     )
-  
-    return results['documents'][:top_n]
+
+    return results["documents"][:top_n]
 
 
 class DuplicateCheckResponse(BaseModel):
@@ -466,19 +488,23 @@ async def llm_check_duplicate(news_text) -> bool:
     Returns True if NOT a duplicate (unique), False if it IS a duplicate.
     """
     _, news_embedding = await embed_text(news_text)
-    
+
     # Get the 3 most similar past news items
     past_news_list = await find_closest_past_news(news_embedding, top_n=3)
-    
+
     # Flatten the list if needed (chromadb returns nested structure)
     if past_news_list and isinstance(past_news_list[0], list):
         past_news_list = past_news_list[0]
-    
+
     # Format past news for the prompt
-    past_news_formatted = "\n\n---\n\n".join(
-        [f"Past News {i+1}:\n{news}" for i, news in enumerate(past_news_list)]
-    ) if past_news_list else "No past news found"
-    
+    past_news_formatted = (
+        "\n\n---\n\n".join(
+            [f"Past News {i + 1}:\n{news}" for i, news in enumerate(past_news_list)]
+        )
+        if past_news_list
+        else "No past news found"
+    )
+
     prompt = f"""
     Determine if the CURRENT NEWS is a duplicate of any of the PAST NEWS items.
     
@@ -501,22 +527,23 @@ async def llm_check_duplicate(news_text) -> bool:
     
     Respond with your assessment.
     """
-    
+
     response = await client.beta.chat.completions.parse(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a news duplicate detection system."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ],
         response_format=DuplicateCheckResponse,
     )
-    
+
     result = response.choices[0].message.parsed
-    
+
     # Return True if NOT duplicate, False if IS duplicate
     return not result.is_duplicate, news_embedding
 
-async def remove_duplicates(top_news, path_to_write = None):
+
+async def remove_duplicates(top_news, write_to_path=None):
     """
     Remove duplicate news items by checking each against past news.
     Returns fresh (non-duplicate) news and their embeddings.
@@ -524,35 +551,31 @@ async def remove_duplicates(top_news, path_to_write = None):
     """
     tasks = []
     for news_item in top_news:
-        news_text = news_item['full_text']
+        news_text = news_item["full_text"]
         tasks.append(llm_check_duplicate(news_text))
-    
+
     results = await asyncio.gather(*tasks)
-    
+
     fresh_news = []
     embeddings = []
-    
-    i = 0 #add 11 news items maximum
+
+    i = 0  # add 11 news items maximum
     for news_item, (is_not_duplicate, news_embedding) in zip(top_news, results):
-        if is_not_duplicate: #filter duplicates
+        if is_not_duplicate:  # filter duplicates
             i += 1
             fresh_news.append(news_item)
             embeddings.append(news_embedding)
             if i > 10:
                 break
-    
-    fresh_news_raw = "\n\n".join([
-        f"{item['full_text']}\n\n" for item in fresh_news
-    ])
 
-    if path_to_write:
-        with open(path_to_write, "w", encoding="utf-8") as f:
+    fresh_news_raw = "\n\n".join([f"{item['full_text']}\n\n" for item in fresh_news])
+
+    if write_to_path:
+        with open(write_to_path, "w", encoding="utf-8") as f:
             f.write(fresh_news_raw)
-    
+
     return fresh_news, embeddings
 
-
-    
 
 async def write_text_vectors(fresh_news, embeddings):
     """
@@ -560,34 +583,28 @@ async def write_text_vectors(fresh_news, embeddings):
     """
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
     collection = chroma_client.get_or_create_collection(name="df_news_embeddings")
-    
+
     # Prepare data for ChromaDB
-    current_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-    
+    current_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
     ids = [f"news_{i}_{current_timestamp}" for i in range(len(fresh_news))]
-    documents = [item['full_text'] for item in fresh_news]
+    documents = [item["full_text"] for item in fresh_news]
     metadatas = [{"added_date": current_date} for item in fresh_news]
 
     # Add to ChromaDB if any fresh news
     if len(fresh_news) > 0:
         collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )       
-    
+            ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas
+        )
+
     print(f"Added {len(fresh_news)} news items to ChromaDB with date {current_date}")
 
 
-
-async def curate_news(raw_news_path: str, output_path: str) -> str:
+async def curate_news(fresh_news: str, write_to_path=None) -> str:
     """
     Process raw news data to create a curated list of top 11 impactful news items.
     """
-    with open(raw_news_path, "r", encoding="utf-8") as f:
-        raw_news = f.read()
 
     # Build agent topics context
 
@@ -612,7 +629,7 @@ async def curate_news(raw_news_path: str, output_path: str) -> str:
        ---
     
     RAW NEWS DATA:
-    {raw_news}
+    {fresh_news}
     
     Provide only the curated news items in the format specified above. Do not include any additional commentary.
     """
@@ -620,17 +637,79 @@ async def curate_news(raw_news_path: str, output_path: str) -> str:
     response = await client.responses.create(
         model="gpt-5-nano",
         reasoning={"effort": "low"},
-        tools=[{"type": "web_search"}],      
+        tools=[{"type": "web_search"}],
         input=prompt,
         max_output_tokens=25000,
     )
 
     curated_news = response.output_text
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(curated_news)
+    if write_to_path:
+        with open(write_to_path, "w", encoding="utf-8") as f:
+            f.write(curated_news)
 
     return curated_news
+
+
+async def html_news(semi_formatted_news: str, write_to_path=None) -> str:
+    """
+    Convert semi-formatted news text to a well-formatted HTML file.
+
+    Args:
+        semi_formatted_news: The text content with news items
+        output_path: Path to save the HTML file
+
+    Returns:
+        Path to the generated HTML file
+    """
+
+    prompt = f"""
+    Convert the following news items into a well-formatted HTML document. 
+    
+    Requirements:
+    1. Create a clean, readable HTML page with proper structure (<!DOCTYPE html>, <html>, <head>, <body>)
+    2. Include CSS styling for:
+       - Clear separation between news items
+       - Proper styling for headlines, dates, links, and content
+    3. Each news item should be clearly separated and easy to read
+    4. Preserve ALL content including headlines, summaries, dates, and links
+    5. Make links clickable
+    6. Add a title to the page like "News Digest - [Current Date]"
+    7. Use semantic HTML elements
+    
+    NEWS CONTENT:
+    {semi_formatted_news}
+    
+    Output only the complete HTML code, nothing else.
+    """
+
+    client = AsyncOpenAI()
+
+    response = await client.chat.completions.create(
+        model="gpt-5-mini",
+        reasoning_effort="low",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an expert HTML/CSS developer who creates clean, well-formatted web pages.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_completion_tokens=15000,
+    )
+
+    html_content = response.choices[0].message.content
+
+    # Remove markdown code fences if present
+    html_content = re.sub(r"^```html\n", "", html_content)
+    html_content = re.sub(r"\n```$", "", html_content)
+    html_content = html_content.strip()
+
+    if write_to_path:
+        with open(write_to_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+    return html_content
 
 
 def print_section(message):
@@ -642,7 +721,7 @@ def print_section(message):
 
 async def main():
     global client
-    
+
     # Initialize OpenAI client based on --openai_api_key argument
     if args.openai_api_key == "False":
         # If argument's value is False, then OpenAI API won't be used
@@ -661,59 +740,70 @@ async def main():
         use_openai = False
 
     if args.use_telegram_api:
-
         print_section("Fetching Telegram context...")
-        telegram_context_file = await get_telegram_context(config, api_hash=args.api_hash, api_id=args.api_id)
+        telegram_context_file = await get_telegram_context(
+            config,
+            write_to_path="telegram_context.txt",
+            api_hash=args.api_hash,
+            api_id=args.api_id,
+        )
 
         print_section("Extracting news from Telegram messages...")
         telegram_news_raw = await extract_telegram_news(config, telegram_context_file)
 
-        #split telegram news
+        # split telegram news
         print_section("Splitting RAW Telegram news into structured chunks...")
-        telegram_chunks = await split_raw_news("news_raw_telegram.txt", "news_raw_telegram_separate_items.json")
+        telegram_chunks = await split_raw_news(
+            raw_news=telegram_news_raw,
+            write_to_path="news_raw_telegram_separate_items.json",
+        )
         telegram_list_of_news = telegram_chunks.output_parsed
 
         print_section("Selecting up to 40 Telegram news with highest priority")
         top_telegram_news = await shuffle_sort_news(telegram_list_of_news, 40)
 
-        print_section('projecting Telegram news items into embeddings...')
-        fresh_telegram_news, telegram_embeddings = await remove_duplicates(top_telegram_news, path_to_write="fresh_telegram_news.txt")
+        print_section("projecting Telegram news items into embeddings...")
+        fresh_telegram_news, telegram_embeddings = await remove_duplicates(
+            top_telegram_news, write_to_path="fresh_telegram_news.txt"
+        )
 
-        print_section('Writing Telegram news embeddings to ChromaDB...')
+        print_section("Writing Telegram news embeddings to ChromaDB...")
         await write_text_vectors(fresh_telegram_news, telegram_embeddings)
 
         # write fresh_telegram_news as a file
-        fresh_telegram_news = "\n\n".join([
-            f"{item['full_text']}\n\n" for item in fresh_telegram_news
-        ])
+        fresh_telegram_news = "\n\n".join(
+            [f"{item['full_text']}\n\n" for item in fresh_telegram_news]
+        )
         # with open("fresh_telegram_news.txt", "w", encoding="utf-8") as f:
         #     f.write(fresh_telegram_news)
 
-        print(f"Telegram news are ready at fresh_telegram_news.txt")
+        print("Telegram news are ready at fresh_telegram_news.txt")
 
     if use_openai:
-
         print_section("Fetching news according to topics in the config")
-        raw_news_path, agent_files = await all_agents_fetch_news(config)
+        raw_news, _ = await all_agents_fetch_news(config)
 
         print_section("Splitting RAW news into structured chunks...")
-        raw_chunks = await split_raw_news("news_raw.txt", "news_raw_separate_items.json")
+        raw_chunks = await split_raw_news(
+            raw_news=raw_news, write_to_path="news_raw_separate_items.json"
+        )
         list_of_news = raw_chunks.output_parsed
 
-        print_section("Selecting 40 news with highest priority")
+        print_section("Selecting 60 news with highest priority")
         top_news = await shuffle_sort_news(list_of_news, 60)
 
-        print_section('projecting news items into embeddings...')
-        fresh_news, embeddings = await remove_duplicates(top_news)
+        print_section("projecting news items into embeddings...")
+        fresh_news, embeddings = await remove_duplicates(
+            top_news, write_to_path="fresh_news.txt"
+        )
 
-        print_section('Writing embeddings to ChromaDB...')
+        print_section("Writing embeddings to ChromaDB...")
         await write_text_vectors(fresh_news, embeddings)
 
         print_section("Curating news...")
-        curated_news = await curate_news("fresh_news.txt", "web_news.txt")
+        curated_news = await curate_news(fresh_news, write_to_path="web_news.txt")
 
-        print(f"News from web are ready at web_news.txt")
-
+        print("News from web are ready at web_news.txt")
 
     if args.use_telegram_api and use_openai:
         print_section("Combining curated news with Telegram news...")
@@ -723,7 +813,17 @@ async def main():
         with open("web_telegram_news.txt", "w", encoding="utf-8") as f:
             f.write(combined_news)
 
-        print(f"Combined news from web and Telegram are ready at web_telegram_news.txt")
+        print("Combined news from web and Telegram are ready at web_telegram_news.txt")
+
+    # Generate HTML output based on what's available
+    print_section("Generating HTML news page...")
+    match (args.use_telegram_api, use_openai):
+        case (True, True):
+            await html_news(combined_news, write_to_path="news.html")
+        case (False, True):
+            await html_news(curated_news, write_to_path="news.html")
+        case (True, False):
+            await html_news(fresh_telegram_news, write_to_path="news.html")
 
     print("\nfinished!")
 
@@ -731,9 +831,6 @@ async def main():
 if __name__ == "__main__":
     args = parse_args()
 
-    config_path = os.path.abspath(args.config)
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_config(args.config)
 
     asyncio.run(main())
