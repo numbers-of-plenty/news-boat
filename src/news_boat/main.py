@@ -160,12 +160,18 @@ async def extract_telegram_news(config, telegram_context) -> str:
     For each relevant news item found in the Telegram messages, format it using this strict structure:
     <NEWS_ITEM>
     ### headline, in one sentence, straight to the point, no ":" or "-" characters, just the news itself
-    - 1-3 sentence summary based on the Telegram message content
+    - 1-2 sentence summary based on the Telegram message content. No "-" it should be a single paragraph. Must be concise and give only additional info beyond the headline.
     - message date YYYY-MM-DD (extract from the message date if available)
     - if a link/URL is mentioned in the message, include it; otherwise write "Source: [the name of the group starting with @ in the end of the message]]"
     <PRIORITY>numeric_value</PRIORITY>
     </NEWS_ITEM>
+
+    Telegram source of the message can be found as the next word starting with "@" after the message content. Might be a little bit further in the text but absolutely always present.
     
+    FILTERING RULES:
+    - Do NOT include somebody's personal opinions on some event (no meta), only hard news
+    - Do NOT include that something continues or is ongoing. It only matters if something started or will happen in the future
+
     PRIORITY RULES:
     4 - Future events one could attend
     3 - News/announcements from the last 3 days
@@ -277,7 +283,7 @@ async def single_agent_news(
 
     Return up to 10 items per topic. Each item must use this format with strict <NEWS_ITEM>/<PRIORITY> tags. Strictly only one news should be included per start-end block:
     <NEWS_ITEM>
-    ### headline, in one sentence, straight to the point, no ":" or "-" characters, don't mention the category/subcategory, just the news itself
+    ### headline, in one sentence, straight to the point, no ":" or "-" characters, don't mention the category/subcategory, just the news itself. 
     - 2-4 sentence summary
     - publication date YYYY-MM-DD or approximate YYYY-MM if exact date unknown
     - single link (Ensure to return the actual URLs, not only reference IDs.)
@@ -296,18 +302,27 @@ async def single_agent_news(
 
     Do not ask for any confirmation; search outright. If you didn't check something for some reason, specify it AFTER all the news items.
     """
-
-    response = await client.responses.create(
-        model="gpt-5-nano",
-        tools=[{"type": "web_search"}],
-        reasoning={"effort": "low"},
-        input=prompt,
-        max_output_tokens=20000,
-    )
-
+    # aid band for hitting rate limits
     filename = f"news_{agent_name}_iter{iteration}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(response.output_text)
+
+    try:
+        response = await client.responses.create(
+            model="gpt-5-nano",
+            tools=[{"type": "web_search"}],
+            reasoning={"effort": "low"},
+            input=prompt,
+            max_output_tokens=20000,
+        )
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(response.output_text)
+    
+    except Exception:
+        print('probably hit rate limit of openai api')
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('')
+        
+        await asyncio.sleep(90)  # 90 seconds to reset TPM rate limit
 
     return filename
 
@@ -622,9 +637,14 @@ async def curate_news(fresh_news: str, write_to_path=None) -> str:
     6. Format each news item with this exact structure so that they were uniform:
        
        ## [Headline]
-       [Several sentence summary copy-pasted from the given news]    
+       [Several sentence summary copy-pasted from the given news.]    
        Date:[publication date or most recent event date. Date must be only here]
        Link:[URL]
+
+    7. No '-' or ":" or other special characters in the headline
+    8. Summary should be a single paragraph, without any bullet points or lists. It should not repeat what's already in the headline.
+    9. The headline should be short. Preffered format is "X did Y". 
+    10. If the news is taken from somewhere, mentioning the source in the headline or summary is redundant because the link exists.
        
        ---
     
